@@ -1,0 +1,17 @@
+[Unit]
+Description=Wordclock Service
+# Netzwerk abwarten, damit die Uhrzeit per NTP synchronisiert werden kann
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/piclock
+Restart=always
+RestartSec=2
+User=pi
+Group=i2c
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

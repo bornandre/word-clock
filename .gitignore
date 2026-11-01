@@ -1,0 +1,17 @@
+# Build
+*.o
+c/piclock
+c/piclock32
+c/test_leds
+tests/actual_times.txt
+
+# Python
+__pycache__/
+*.pyc
+led_liste.csv
+
+# Editor / OS
+*.swp
+*~
+.vscode/
+.DS_Store
