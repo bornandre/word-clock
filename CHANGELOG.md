@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 – 2026-11-06
+
+- **Webseite** (`wordclock-web`): WLAN wählen, Zeitzone und Uhrzeit stellen (auch RTC),
+  Helligkeit, Nachtmodus, Passwort, Neustart/Ausschalten. Python-Standardbibliothek,
+  läuft auf dem Raspberry Pi 1.
+- **Setup-Hotspot** (`wordclock-wifi`): ohne WLAN-Verbindung eigener Hotspot mit
+  Captive Portal (hostapd + dnsmasq, für Bullseye/dhcpcd). Installation mit `make install-wifi`.
+- `piclock` liest `/etc/wordclock/wordclock.conf` (Helligkeit, Nachtmodus) und übernimmt
+  Änderungen ohne Neustart; im Hotspot-Modus blinken die Minutenpunkte.
+- Neue Optionen `piclock -c` und `-p`.
+- `make check` testet zusätzlich Einstellungsdatei, WLAN-Skript und Webseite.
+
 ## 1.0.0 – 2026-11-01
 
 Erste Version auf GitHub.

@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wordclock-web – Konfigurationsseite der Wortuhr
+
+Läuft als Dienst auf Port 80 und ist erreichbar
+  - im Heimnetz unter http://<hostname>.local
+  - im Setup-Hotspot unter http://10.42.0.1 (öffnet sich auf Handys automatisch)
+
+Funktionen: WLAN wählen, Zeitzone und Uhrzeit stellen (inkl. RTC), Helligkeit und
+Nachtmodus, Passwort ändern, Neustart/Ausschalten.
+
+Nur Python-Standardbibliothek (ab 3.9). Muss als root laufen, weil es
+wpa_supplicant.conf schreibt und die Systemzeit stellt.
+
+  wordclock-web                      normaler Betrieb
+  wordclock-web --demo --port 8080   Demo ohne Pi: nichts wird ausgeführt,
+                                     Dateien landen unter /tmp/wordclock-demo
+"""
+
+import argparse
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+from string import Template
+
+VERSION = "1.1.0"
+AP_ADDR = "10.42.0.1"
+SESSION_HOURS = 12
+BRIGHTNESS_STEPS = [0, 3, 6, 9, 12, 15, 18, 21]
+
+
+# ---------------------------------------------------------------------------
+# Umgebung: Dateipfade und Befehle (im Demo-Modus simuliert)
+# ---------------------------------------------------------------------------
+class Env:
+    def __init__(self, root="", demo=False):
+        self.demo = demo
+
+        def p(path):
+            return os.path.join(root, path.lstrip("/")) if root else path
+
+        self.conf = p("/etc/wordclock/wordclock.conf")
+        self.secret = p("/etc/wordclock/secret.conf")
+        self.wpa = p("/etc/wpa_supplicant/wpa_supplicant.conf")
+        self.run_dir = p("/run/wordclock")
+        self.rtc = "/dev/rtc0"
+        self.iface = read_kv(self.conf).get("wifi_interface", "wlan0")
+        self._tz_cache = None
+
+    def run(self, args, timeout=30):
+        """Befehl ausführen -> (returncode, stdout). Im Demo-Modus simuliert."""
+        if self.demo:
+            return demo_run(self, args)
+        try:
+            r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=timeout)
+            return r.returncode, r.stdout
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 1, str(e)
+
+    def later(self, args, delay=2.0):
+        """Befehl verzögert im Hintergrund ausführen (nach dem Senden der Antwort)."""
+        def job():
+            time.sleep(delay)
+            self.run(args)
+        threading.Thread(target=job, daemon=True).start()
+
+    # --- Status ------------------------------------------------------------
+    def wifi_state(self):
+        try:
+            with open(os.path.join(self.run_dir, "state")) as f:
+                return f.read().strip() or "unknown"
+        except OSError:
+            return "unknown"
+
+    def wifi_status(self):
+        rc, out = self.run(["wpa_cli", "-i", self.iface, "status"])
+        info = {}
+        if rc == 0:
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k] = v
+        return info
+
+    def timedate(self):
+        rc, out = self.run(["timedatectl", "show"])
+        info = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k] = v
+        return info
+
+    def timezones(self):
+        if self._tz_cache is None:
+            rc, out = self.run(["timedatectl", "list-timezones"])
+            self._tz_cache = [z for z in out.split() if "/" in z or z == "UTC"] if rc == 0 else []
+        return self._tz_cache
+
+    def has_rtc(self):
+        return self.demo or os.path.exists(self.rtc)
+
+
+# ---------------------------------------------------------------------------
+# key=value-Dateien
+# ---------------------------------------------------------------------------
+def read_kv(path, strip_comments=True):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if strip_comments:
+                    line = re.sub(r"(^|\s)#.*$", "", line)
+                if "=" not in line or line.lstrip().startswith("#"):
+                    continue
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip() if strip_comments else v.lstrip(" ")
+    except OSError:
+        pass
+    return values
+
+
+def write_atomic(path, text, mode):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update_kv(path, updates, mode=0o644):
+    """Einträge ändern, Kommentare und Reihenfolge der Datei bleiben erhalten."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    done = set()
+    out = []
+    for line in lines:
+        m = re.match(r"\s*([A-Za-z0-9_]+)\s*=", line)
+        if m and m.group(1) in updates:
+            key = m.group(1)
+            if key in done:
+                continue                     # doppelte Einträge entfernen
+            out.append("%s = %s" % (key, updates[key]))
+            done.add(key)
+        else:
+            out.append(line)
+    for key, value in updates.items():
+        if key not in done:
+            out.append("%s = %s" % (key, value))
+    write_atomic(path, "\n".join(out) + "\n", mode)
+
+
+# ---------------------------------------------------------------------------
+# wpa_supplicant.conf
+# ---------------------------------------------------------------------------
+WPA_HEADER = ("ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n"
+              "update_config=1\n"
+              "country=CH\n")
+
+
+def _decode_ssid(value):
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    try:
+        return bytes.fromhex(value).decode("utf-8", "replace")
+    except ValueError:
+        return value
+
+
+def read_wpa(path):
+    """-> (Kopfteil, Liste von {'ssid', 'priority', 'text'})"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return WPA_HEADER, []
+    networks = []
+    header = []
+    block = None
+    for line in text.splitlines():
+        if block is None:
+            if re.match(r"\s*network\s*=\s*\{", line):
+                block = [line]
+            else:
+                header.append(line)
+        else:
+            block.append(line)
+            if line.strip() == "}":
+                body = "\n".join(block)
+                ssid = re.search(r"^\s*ssid\s*=\s*(.+)$", body, re.M)
+                prio = re.search(r"^\s*priority\s*=\s*(-?\d+)", body, re.M)
+                networks.append({"ssid": _decode_ssid(ssid.group(1)) if ssid else "",
+                                 "priority": int(prio.group(1)) if prio else 0,
+                                 "text": body})
+                block = None
+    head = "\n".join(header).strip()
+    return (head + "\n" if head else WPA_HEADER), networks
+
+
+def write_wpa(path, header, networks):
+    text = header.rstrip("\n") + "\n"
+    for n in networks:
+        text += "\n" + n["text"].rstrip("\n") + "\n"
+    write_atomic(path, text, 0o600)
+
+
+def wpa_add(path, ssid, password):
+    header, networks = read_wpa(path)
+    networks = [n for n in networks if n["ssid"] != ssid]
+    prio = max([n["priority"] for n in networks] + [0]) + 1
+    lines = ["network={", "\tssid=%s" % ssid.encode("utf-8").hex()]
+    if password:
+        psk = hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"),
+                                  ssid.encode("utf-8"), 4096, 32).hex()
+        lines += ["\tpsk=%s" % psk, "\tkey_mgmt=WPA-PSK"]
+    else:
+        lines.append("\tkey_mgmt=NONE")
+    lines += ["\tpriority=%d" % prio, "\tid_str=\"wordclock\"", "}"]
+    networks.append({"ssid": ssid, "priority": prio, "text": "\n".join(lines)})
+    write_wpa(path, header, networks)
+
+
+def wpa_remove(path, ssid):
+    header, networks = read_wpa(path)
+    remaining = [n for n in networks if n["ssid"] != ssid]
+    if len(remaining) != len(networks):
+        write_wpa(path, header, remaining)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# WLAN-Suche
+# ---------------------------------------------------------------------------
+_scan_cache = {"time": 0.0, "result": []}
+_scan_lock = threading.Lock()
+
+
+def _iw_unescape(s):
+    raw = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+    try:
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def parse_iw_scan(out):
+    nets = {}
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("BSS "):
+            cur = {"ssid": "", "signal": -100.0, "secure": False}
+            nets.setdefault(id(cur), cur)
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("signal:"):
+            try:
+                cur["signal"] = float(s.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif s.startswith("SSID:"):
+            cur["ssid"] = _iw_unescape(s[5:].strip())
+        elif s.startswith("RSN:") or s.startswith("WPA:") or (
+                s.startswith("capability:") and "Privacy" in s):
+            cur["secure"] = True
+    best = {}
+    for n in nets.values():
+        if n["ssid"] and (n["ssid"] not in best or n["signal"] > best[n["ssid"]]["signal"]):
+            best[n["ssid"]] = n
+    result = sorted(best.values(), key=lambda n: -n["signal"])
+    for n in result:
+        # dBm grob in 0..4 Balken umrechnen
+        n["bars"] = max(0, min(4, int((n["signal"] + 95) / 10)))
+    return result
+
+
+def wifi_scan(env):
+    with _scan_lock:
+        if time.time() - _scan_cache["time"] < 15:
+            return _scan_cache["result"]
+        rc, out = env.run(["iw", "dev", env.iface, "scan"], timeout=20)
+        if rc != 0:
+            rc, out = env.run(["iw", "dev", env.iface, "scan", "ap-force"], timeout=20)
+        result = parse_iw_scan(out) if rc == 0 else []
+        _scan_cache.update(time=time.time(), result=result)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Demo-Modus
+# ---------------------------------------------------------------------------
+DEMO_SCAN = """BSS 11:22:33:44:55:66(on wlan0)
+\tcapability: ESS Privacy ShortSlotTime (0x0411)
+\tsignal: -48.00 dBm
+\tSSID: Zuhause
+\tRSN:\t * Version: 1
+BSS 11:22:33:44:55:67(on wlan0)
+\tsignal: -71.00 dBm
+\tSSID: Nachbar 5G
+\tRSN:\t * Version: 1
+BSS 11:22:33:44:55:68(on wlan0)
+\tcapability: ESS ShortSlotTime (0x0401)
+\tsignal: -83.00 dBm
+\tSSID: Gr\\xc3\\xbcezi-Gast
+"""
+
+
+def demo_run(env, args):
+    cmd = " ".join(args)
+    if args[:2] == ["timedatectl", "show"]:
+        return 0, ("Timezone=Europe/Zurich\nNTP=yes\nNTPSynchronized=%s\n"
+                   % ("yes" if env.wifi_state() == "client" else "no"))
+    if args[:2] == ["timedatectl", "list-timezones"]:
+        return 0, "UTC\nEurope/Berlin\nEurope/Vienna\nEurope/Zurich\nAmerica/New_York\n"
+    if args[:1] == ["iw"] and "scan" in args:
+        return 0, DEMO_SCAN
+    if args[:1] == ["wpa_cli"]:
+        if env.wifi_state() == "client":
+            return 0, "wpa_state=COMPLETED\nssid=Zuhause\nip_address=192.168.1.42\n"
+        return 1, ""
+    sys.stderr.write("[demo] würde ausführen: %s\n" % cmd)
+    return 0, ""
+
+
+# ---------------------------------------------------------------------------
+# Sitzungen
+# ---------------------------------------------------------------------------
+class Sessions:
+    def __init__(self):
+        self._s = {}
+        self._lock = threading.Lock()
+
+    def create(self):
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._s[token] = time.time() + SESSION_HOURS * 3600
+        return token
+
+    def valid(self, token):
+        if not token:
+            return False
+        with self._lock:
+            exp = self._s.get(token)
+            if exp and exp > time.time():
+                return True
+            self._s.pop(token, None)
+        return False
+
+    def drop(self, token):
+        with self._lock:
+            self._s.pop(token, None)
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+CSS = """
+:root{--bg:#f4f2ee;--card:#fff;--fg:#1d1b19;--muted:#6b665f;--line:#e2ded7;
+--accent:#b8571d;--accent-fg:#fff;--ok:#2f7d4a;--warn:#a5641a;--err:#b3261e;--field:#fbfaf8}
+@media (prefers-color-scheme:dark){:root{--bg:#161412;--card:#211e1b;--fg:#ece8e2;
+--muted:#a39d94;--line:#36312c;--accent:#e0874e;--accent-fg:#1b130d;--ok:#6cc08b;
+--warn:#e2a35a;--err:#f08a80;--field:#1b1916}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:560px;margin:0 auto;padding:16px 16px 48px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:8px 0 16px}
+h1{font-size:1.5rem;margin:0;letter-spacing:.02em}
+.clock{font-variant-numeric:tabular-nums;color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:0 0 14px}
+h2{font-size:1.05rem;margin:0 0 12px}
+label{display:block;font-size:.9rem;color:var(--muted);margin:10px 0 4px}
+input,select,button{font:inherit}
+input[type=text],input[type=password],input[type=datetime-local],input[type=time],select{
+width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+background:var(--field);color:var(--fg)}
+.row{display:flex;gap:10px}.row>*{flex:1}
+button,.btn{display:inline-block;border:0;border-radius:10px;padding:10px 16px;
+background:var(--accent);color:var(--accent-fg);font-weight:600;cursor:pointer;margin-top:14px}
+button.secondary{background:transparent;color:var(--accent);border:1px solid var(--line)}
+button.danger{background:transparent;color:var(--err);border:1px solid var(--line)}
+button.link{background:none;color:var(--accent);padding:0;margin:0;font-weight:500}
+.status{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:.95rem}
+.status dt{color:var(--muted)}.status dd{margin:0}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}
+.msg{border-radius:10px;padding:10px 12px;margin:0 0 14px;border:1px solid var(--line);background:var(--card)}
+.msg.ok{border-left:4px solid var(--ok)}.msg.err{border-left:4px solid var(--err)}
+.msg.info{border-left:4px solid var(--warn)}
+ul.nets{list-style:none;padding:0;margin:0}
+ul.nets li{display:flex;justify-content:space-between;align-items:center;padding:8px 0;
+border-bottom:1px solid var(--line)}
+ul.nets li:last-child{border-bottom:0}
+.scan{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.scan button{margin:0;text-align:left;background:var(--field);color:var(--fg);
+border:1px solid var(--line);font-weight:500;display:flex;justify-content:space-between}
+.hint{font-size:.85rem;color:var(--muted);margin:8px 0 0}
+.check{display:flex;align-items:center;gap:8px;margin-top:12px;color:var(--fg);font-size:1rem}
+footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:24px}
+"""
+
+PAGE = Template("""<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wortuhr</title><style>$css</style></head>
+<body><main>
+$body
+<footer>wordclock-web $version · $hostname</footer>
+</main>$script</body></html>""")
+
+LOGIN = Template("""
+<header><h1>Wortuhr</h1></header>
+$msg
+<form class="card" method="post" action="/login">
+<h2>Anmelden</h2>
+<label for="pw">Passwort</label>
+<input id="pw" type="password" name="password" autofocus autocomplete="current-password">
+<p class="hint">Standard: <b>wordclock</b> (gleiches Passwort wie der Setup-Hotspot)</p>
+<button type="submit">Anmelden</button>
+</form>""")
+
+MAIN = Template("""
+<header><h1>Wortuhr</h1><span class="clock" id="clock">$time_now</span></header>
+$msg
+
+<section class="card">
+<h2>Status</h2>
+<dl class="status">
+<dt>WLAN</dt><dd>$wifi_status</dd>
+<dt>Adresse</dt><dd>$address</dd>
+<dt>Uhrzeit</dt><dd>$time_status</dd>
+</dl>
+</section>
+
+<section class="card" id="wlan">
+<h2>WLAN</h2>
+$known
+<form method="post" action="/wifi" id="wifiform">
+<input type="hidden" name="csrf" value="$csrf">
+<label for="ssid">Netzwerk</label>
+<input id="ssid" type="text" name="ssid" required maxlength="32" autocomplete="off"
+ placeholder="Name eingeben oder unten wählen">
+<div class="scan" id="scanlist"></div>
+<button type="button" class="link" id="scanbtn" style="margin-top:8px">Netzwerke suchen</button>
+<label for="psk">WLAN-Passwort</label>
+<input id="psk" type="password" name="psk" maxlength="63" autocomplete="off"
+ placeholder="leer bei offenem WLAN">
+<label class="check"><input type="checkbox" id="showpsk"> Passwort anzeigen</label>
+<button type="submit">Verbinden</button>
+<p class="hint">$wifi_hint</p>
+</form>
+</section>
+
+<section class="card" id="zeit">
+<h2>Zeit</h2>
+<form method="post" action="/timezone">
+<input type="hidden" name="csrf" value="$csrf">
+<label for="tz">Zeitzone</label>
+<select id="tz" name="tz">$tz_options</select>
+<button type="submit" class="secondary">Zeitzone speichern</button>
+</form>
+<form method="post" action="/time">
+<input type="hidden" name="csrf" value="$csrf">
+<label for="dt">Datum und Uhrzeit von Hand stellen</label>
+<input id="dt" type="datetime-local" name="datetime" step="1" value="$dt_value" required>
+<button type="button" class="link" id="phonetime" style="margin-top:8px">Zeit vom Handy übernehmen</button><br>
+<button type="submit">Uhr stellen</button>
+<p class="hint">Wird auch in die Echtzeituhr (RTC) geschrieben. Mit Internet stellt sich
+die Uhr automatisch.</p>
+</form>
+</section>
+
+<section class="card" id="anzeige">
+<h2>Anzeige</h2>
+<form method="post" action="/display">
+<input type="hidden" name="csrf" value="$csrf">
+<label for="br">Helligkeit</label>
+<select id="br" name="brightness">$brightness_options</select>
+<label class="check"><input type="checkbox" name="night_enabled" value="1" $night_checked> Nachtmodus</label>
+<div class="row">
+<div><label for="ns">von</label><input id="ns" type="time" name="night_start" value="$night_start"></div>
+<div><label for="ne">bis</label><input id="ne" type="time" name="night_end" value="$night_end"></div>
+</div>
+<label for="nb">Helligkeit in der Nacht</label>
+<select id="nb" name="night_brightness">$night_options</select>
+<button type="submit">Speichern</button>
+<p class="hint">Änderungen sind nach etwa einer Sekunde sichtbar.</p>
+</form>
+</section>
+
+<section class="card" id="passwort">
+<h2>Passwort</h2>
+<form method="post" action="/password">
+<input type="hidden" name="csrf" value="$csrf">
+<label for="pw0">Aktuelles Passwort</label>
+<input id="pw0" type="password" name="current" required autocomplete="current-password">
+<label for="pw1">Neues Passwort (8–63 Zeichen)</label>
+<input id="pw1" type="password" name="new" required minlength="8" maxlength="63" autocomplete="new-password">
+<label for="pw2">Wiederholen</label>
+<input id="pw2" type="password" name="repeat" required minlength="8" maxlength="63" autocomplete="new-password">
+<button type="submit" class="secondary">Passwort ändern</button>
+<p class="hint">Gilt für diese Seite und den Setup-Hotspot.</p>
+</form>
+</section>
+
+<section class="card" id="system">
+<h2>System</h2>
+<form method="post" action="/system" onsubmit="return confirm('Wirklich?')">
+<input type="hidden" name="csrf" value="$csrf">
+<div class="row">
+<button type="submit" name="action" value="reboot" class="secondary">Neu starten</button>
+<button type="submit" name="action" value="poweroff" class="danger">Ausschalten</button>
+</div>
+</form>
+<form method="post" action="/logout">
+<input type="hidden" name="csrf" value="$csrf">
+<button type="submit" class="link" style="margin-top:14px">Abmelden</button>
+</form>
+</section>
+""")
+
+SCRIPT = Template("""<script>
+(function(){
+var off=$epoch_ms-Date.now(), gmt=$gmtoff;
+function pad(n){return (n<10?'0':'')+n}
+function local(){return new Date(Date.now()+off+gmt*1000)}
+function tick(){var d=local();document.getElementById('clock').textContent=
+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds())}
+tick();setInterval(tick,1000);
+var ssid=document.getElementById('ssid'),psk=document.getElementById('psk');
+document.getElementById('showpsk').onchange=function(){psk.type=this.checked?'text':'password'};
+var list=document.getElementById('scanlist'),btn=document.getElementById('scanbtn');
+function scan(){btn.textContent='Suche …';
+fetch('/api/scan',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(n){
+list.innerHTML='';
+if(!n.length){list.innerHTML='<p class="hint">Keine Netzwerke gefunden. Namen von Hand eingeben.</p>'}
+n.forEach(function(x){var b=document.createElement('button');b.type='button';
+var l=document.createElement('span');l.textContent=x.ssid+(x.secure?' 🔒':'');
+var r=document.createElement('span');r.textContent='▂▄▆█'.slice(0,Math.max(1,x.bars));
+b.appendChild(l);b.appendChild(r);
+b.onclick=function(){ssid.value=x.ssid;psk.focus()};list.appendChild(b)});
+btn.textContent='Erneut suchen'}).catch(function(){btn.textContent='Suche fehlgeschlagen – erneut versuchen'})}
+btn.onclick=scan;scan();
+document.getElementById('phonetime').onclick=function(){var d=new Date();
+document.getElementById('dt').value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+
+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())};
+})();
+</script>""")
+
+MESSAGES = {
+    "login_failed": ("err", "Falsches Passwort."),
+    "logged_out": ("info", "Abgemeldet."),
+    "csrf": ("err", "Sitzung abgelaufen, bitte erneut versuchen."),
+    "wifi_saved": ("ok", "WLAN „%s“ gespeichert. Die Uhr verbindet sich neu."),
+    "wifi_saved_ap": ("ok", "WLAN „%s“ gespeichert. Der Hotspot wird jetzt beendet und die Uhr "
+                            "verbindet sich mit dem WLAN. Verbinde dein Handy wieder mit deinem "
+                            "WLAN und öffne danach http://%s.local"),
+    "wifi_removed": ("ok", "WLAN „%s“ entfernt."),
+    "wifi_invalid": ("err", "Bitte einen Netzwerknamen (max. 32 Zeichen) und ein Passwort mit "
+                            "8–63 Zeichen angeben – oder leer bei offenem WLAN."),
+    "tz_saved": ("ok", "Zeitzone gespeichert."),
+    "tz_invalid": ("err", "Unbekannte Zeitzone."),
+    "time_saved": ("ok", "Uhr gestellt."),
+    "time_invalid": ("err", "Ungültiges Datum oder ungültige Uhrzeit."),
+    "time_failed": ("err", "Die Uhrzeit konnte nicht gestellt werden: %s"),
+    "display_saved": ("ok", "Anzeige gespeichert."),
+    "display_invalid": ("err", "Ungültige Eingabe bei der Anzeige."),
+    "pw_saved": ("ok", "Passwort geändert. Es gilt ab dem nächsten Start auch für den Hotspot."),
+    "pw_wrong": ("err", "Das aktuelle Passwort stimmt nicht."),
+    "pw_invalid": ("err", "Das neue Passwort braucht 8–63 Zeichen (keine Umlaute, kein "
+                          "Leerzeichen am Anfang oder Ende) und beide Eingaben müssen gleich sein."),
+    "reboot": ("info", "Die Uhr startet neu. Die Seite ist in etwa einer Minute wieder erreichbar."),
+    "poweroff": ("info", "Die Uhr wird ausgeschaltet. Warte etwa 20 Sekunden, bevor du den "
+                         "Stecker ziehst."),
+}
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def options(values, selected, label=lambda v: v):
+    return "".join('<option value="%s"%s>%s</option>' % (
+        esc(v), " selected" if str(v) == str(selected) else "", esc(label(v)))
+        for v in values)
+
+
+def brightness_label(ma):
+    if ma == 0:
+        return "aus"
+    return "%d %% (%d mA)" % (round(ma * 100 / 21), ma)
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "wordclock-web/" + VERSION
+    env = None          # type: Env
+    sessions = None     # type: Sessions
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    # --- Hilfsfunktionen ------------------------------------------------------
+    def _token(self):
+        cookie = self.headers.get("Cookie", "")
+        m = re.search(r"(?:^|;\s*)wcsession=([A-Za-z0-9_\-]+)", cookie)
+        return m.group(1) if m else None
+
+    def _logged_in(self):
+        return self.sessions.valid(self._token())
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _redirect(self, location, headers=None):
+        h = {"Location": location}
+        h.update(headers or {})
+        self._send(303, "", headers=h)
+
+    def _msg(self, code, *args):
+        q = {"m": code}
+        if args:
+            q["a"] = json.dumps(args)
+        return "/?" + urllib.parse.urlencode(q)
+
+    def _form(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 16384:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+
+    def _captive_redirect(self):
+        """Im Hotspot alle fremden Adressen auf die Setup-Seite umleiten."""
+        if self.env.wifi_state() != "ap":
+            return False
+        host = (self.headers.get("Host") or "").split(":")[0].lower()
+        name = socket.gethostname().lower()
+        if host in (AP_ADDR, name, name + ".local", "localhost", "127.0.0.1"):
+            return False
+        self._redirect("http://%s/" % AP_ADDR)
+        return True
+
+    def _page(self, body, script=""):
+        return PAGE.substitute(css=CSS, body=body, script=script, version=VERSION,
+                               hostname=esc(socket.gethostname()))
+
+    def _render_msg(self, query):
+        code = query.get("m", [""])[0]
+        if code not in MESSAGES:
+            return ""
+        kind, text = MESSAGES[code]
+        try:
+            args = json.loads(query.get("a", ["[]"])[0])
+            if not isinstance(args, list):
+                args = []
+        except ValueError:
+            args = []
+        n = text.count("%s")
+        args = [str(a)[:80] for a in args][:n] + [""] * max(0, n - len(args))
+        return '<div class="msg %s">%s</div>' % (kind, esc(text % tuple(args)))
+
+    # --- GET ----------------------------------------------------------------
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        if self._captive_redirect():
+            return
+        url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(url.query)
+
+        if url.path == "/api/scan":
+            if not self._logged_in():
+                return self._send(403, "[]", "application/json")
+            return self._send(200, json.dumps(wifi_scan(self.env)), "application/json")
+
+        if url.path != "/":
+            return self._redirect("/")
+
+        if not self._logged_in():
+            return self._send(200, self._page(LOGIN.substitute(msg=self._render_msg(query))))
+        return self._send(200, self._main_page(query))
+
+    def _main_page(self, query):
+        env = self.env
+        token = self._token()
+        state = env.wifi_state()
+        wpa = env.wifi_status()
+        td = env.timedate()
+        cfg = read_kv(env.conf)
+        hostname = socket.gethostname()
+
+        if state == "client" and wpa.get("wpa_state") == "COMPLETED":
+            wifi_status = '<span class="dot ok"></span>verbunden mit „%s“' % esc(wpa.get("ssid", ""))
+            address = "%s · http://%s.local" % (esc(wpa.get("ip_address", "–")), esc(hostname))
+            wifi_hint = "Ein neues WLAN wird bevorzugt verwendet. Bekannte WLANs bleiben gespeichert."
+        elif state == "ap":
+            ap_ssid = cfg.get("ap_ssid", "WordClock-Setup")
+            wifi_status = '<span class="dot warn"></span>Setup-Hotspot „%s“ aktiv' % esc(ap_ssid)
+            address = "http://%s" % AP_ADDR
+            wifi_hint = ("Nach dem Speichern wird der Hotspot beendet und die Uhr verbindet "
+                         "sich mit dem gewählten WLAN.")
+        elif state == "connecting":
+            wifi_status = '<span class="dot warn"></span>verbinde …'
+            address = "–"
+            wifi_hint = ""
+        else:
+            wifi_status = '<span class="dot err"></span>nicht verbunden'
+            address = "–"
+            wifi_hint = ""
+
+        synced = td.get("NTPSynchronized") == "yes"
+        time_status = ('<span class="dot %s"></span>%s · %s' % (
+            "ok" if synced else "warn",
+            "automatisch synchronisiert" if synced else "nicht synchronisiert",
+            "RTC vorhanden" if env.has_rtc() else "keine RTC"))
+
+        _, networks = read_wpa(env.wpa)
+        if networks:
+            items = "".join(
+                '<li><span>%s</span><form method="post" action="/wifi/remove" '
+                'onsubmit="return confirm(\'WLAN entfernen?\')">'
+                '<input type="hidden" name="csrf" value="%s">'
+                '<input type="hidden" name="ssid" value="%s">'
+                '<button class="link" type="submit">entfernen</button></form></li>'
+                % (esc(n["ssid"]), esc(token), esc(n["ssid"]))
+                for n in sorted(networks, key=lambda n: -n["priority"]))
+            known = '<label>Gespeicherte WLANs</label><ul class="nets">%s</ul>' % items
+        else:
+            known = '<p class="hint">Noch kein WLAN gespeichert.</p>'
+
+        tz = td.get("Timezone", "Europe/Zurich")
+        zones = env.timezones() or [tz]
+        now = time.time()
+        lt = time.localtime(now)
+
+        def hhmm(key, default):
+            v = cfg.get(key, default)
+            return v if re.match(r"^\d{1,2}:\d{2}$", v) else default
+
+        try:
+            br = int(cfg.get("brightness", "3"))
+        except ValueError:
+            br = 3
+        try:
+            nbr = int(cfg.get("night_brightness", "3"))
+        except ValueError:
+            nbr = 3
+        night_on = cfg.get("night_enabled", "0").lower() in ("1", "yes", "true", "on", "ja")
+
+        body = MAIN.substitute(
+            msg=self._render_msg(query),
+            time_now=time.strftime("%H:%M:%S", lt),
+            wifi_status=wifi_status, address=address, time_status=time_status,
+            known=known, wifi_hint=wifi_hint, csrf=esc(token),
+            tz_options=options(zones, tz),
+            dt_value=time.strftime("%Y-%m-%dT%H:%M:%S", lt),
+            brightness_options=options(BRIGHTNESS_STEPS, br, brightness_label),
+            night_checked="checked" if night_on else "",
+            night_start=esc(hhmm("night_start", "22:00")),
+            night_end=esc(hhmm("night_end", "06:30")),
+            night_options=options(BRIGHTNESS_STEPS, nbr, brightness_label))
+        script = SCRIPT.substitute(epoch_ms=int(now * 1000), gmtoff=lt.tm_gmtoff)
+        return self._page(body, script)
+
+    # --- POST ---------------------------------------------------------------
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        form = self._form()
+
+        if path == "/login":
+            pw = read_kv(self.env.secret, strip_comments=False).get("password", "wordclock")
+            if secrets.compare_digest(form.get("password", "").encode(), pw.encode()):
+                token = self.sessions.create()
+                return self._redirect("/", {"Set-Cookie": "wcsession=%s; Path=/; HttpOnly; "
+                                                          "SameSite=Strict" % token})
+            time.sleep(1.5)
+            return self._redirect(self._msg("login_failed"))
+
+        if not self._logged_in():
+            return self._redirect("/")
+        if not secrets.compare_digest(form.get("csrf", "").encode(), (self._token() or "").encode()):
+            return self._redirect(self._msg("csrf"))
+
+        handler = {
+            "/logout": self.post_logout,
+            "/wifi": self.post_wifi,
+            "/wifi/remove": self.post_wifi_remove,
+            "/timezone": self.post_timezone,
+            "/time": self.post_time,
+            "/display": self.post_display,
+            "/password": self.post_password,
+            "/system": self.post_system,
+        }.get(path)
+        if handler is None:
+            return self._redirect("/")
+        return self._redirect(handler(form))
+
+    def post_logout(self, form):
+        self.sessions.drop(self._token())
+        return self._msg("logged_out")
+
+    def post_wifi(self, form):
+        ssid = form.get("ssid", "").strip()
+        psk = form.get("psk", "")
+        if (not ssid or len(ssid.encode("utf-8")) > 32 or
+                (psk and not (8 <= len(psk) <= 63))):
+            return self._msg("wifi_invalid")
+        wpa_add(self.env.wpa, ssid, psk)
+        was_ap = self.env.wifi_state() == "ap"
+        self.env.later(["systemctl", "reload", "wordclock-wifi"])
+        if was_ap:
+            return self._msg("wifi_saved_ap", ssid, socket.gethostname())
+        return self._msg("wifi_saved", ssid)
+
+    def post_wifi_remove(self, form):
+        ssid = form.get("ssid", "")
+        if wpa_remove(self.env.wpa, ssid):
+            current = self.env.wifi_status().get("ssid")
+            if current == ssid:
+                self.env.later(["systemctl", "reload", "wordclock-wifi"])
+            else:
+                self.env.run(["wpa_cli", "-i", self.env.iface, "reconfigure"])
+        return self._msg("wifi_removed", ssid)
+
+    def post_timezone(self, form):
+        tz = form.get("tz", "")
+        if tz not in self.env.timezones():
+            return self._msg("tz_invalid")
+        rc, out = self.env.run(["timedatectl", "set-timezone", tz])
+        if rc != 0:
+            return self._msg("time_failed", out.strip())
+        os.environ["TZ"] = tz
+        time.tzset()
+        # piclock liest die Zeitzone nur beim Start (glibc), daher neu starten
+        self.env.later(["systemctl", "restart", "piclock"], delay=0.5)
+        return self._msg("tz_saved")
+
+    def post_time(self, form):
+        value = form.get("datetime", "")
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$", value)
+        if not m:
+            return self._msg("time_invalid")
+        y, mo, d, h, mi, s = (int(x or 0) for x in m.groups())
+        try:
+            time.strptime("%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s),
+                          "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return self._msg("time_invalid")
+        if not 2020 <= y <= 2099:
+            return self._msg("time_invalid")
+        stamp = "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s)
+        self.env.run(["timedatectl", "set-ntp", "false"])
+        rc, out = self.env.run(["timedatectl", "set-time", stamp])
+        if rc == 0 and self.env.has_rtc():
+            self.env.run(["hwclock", "--systohc"])
+        self.env.run(["timedatectl", "set-ntp", "true"])
+        if rc != 0:
+            return self._msg("time_failed", out.strip())
+        return self._msg("time_saved")
+
+    def post_display(self, form):
+        try:
+            br = int(form.get("brightness", ""))
+            nbr = int(form.get("night_brightness", ""))
+        except ValueError:
+            return self._msg("display_invalid")
+        ns, ne = form.get("night_start", ""), form.get("night_end", "")
+        hhmm = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+        if br not in BRIGHTNESS_STEPS or nbr not in BRIGHTNESS_STEPS or \
+                not hhmm.match(ns) or not hhmm.match(ne):
+            return self._msg("display_invalid")
+        update_kv(self.env.conf, {
+            "brightness": br,
+            "night_enabled": "1" if form.get("night_enabled") == "1" else "0",
+            "night_start": ns,
+            "night_end": ne,
+            "night_brightness": nbr,
+        })
+        return self._msg("display_saved")
+
+    def post_password(self, form):
+        current = read_kv(self.env.secret, strip_comments=False).get("password", "wordclock")
+        if not secrets.compare_digest(form.get("current", "").encode(), current.encode()):
+            time.sleep(1.5)
+            return self._msg("pw_wrong")
+        new, rep = form.get("new", ""), form.get("repeat", "")
+        if (new != rep or not 8 <= len(new) <= 63 or new != new.strip() or
+                not re.match(r"^[\x20-\x7e]+$", new)):
+            return self._msg("pw_invalid")
+        update_kv(self.env.secret, {"password": new}, mode=0o600)
+        return self._msg("pw_saved")
+
+    def post_system(self, form):
+        action = form.get("action")
+        if action == "reboot":
+            self.env.later(["systemctl", "reboot"])
+            return self._msg("reboot")
+        if action == "poweroff":
+            self.env.later(["systemctl", "poweroff"])
+            return self._msg("poweroff")
+        return "/"
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Konfigurationsseite der Wortuhr")
+    ap.add_argument("--port", type=int, default=80)
+    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--demo", action="store_true",
+                    help="nichts ausführen, Dateien unter --root (Standard /tmp/wordclock-demo)")
+    ap.add_argument("--root", default=None, help="Wurzelverzeichnis für alle Dateien (Tests)")
+    args = ap.parse_args()
+
+    root = args.root if args.root is not None else ("/tmp/wordclock-demo" if args.demo else "")
+    env = Env(root=root, demo=args.demo)
+    if args.demo:
+        os.makedirs(env.run_dir, exist_ok=True)
+        if not os.path.exists(os.path.join(env.run_dir, "state")):
+            with open(os.path.join(env.run_dir, "state"), "w") as f:
+                f.write("client\n")
+
+    Handler.env = env
+    Handler.sessions = Sessions()
+    srv = Server((args.bind, args.port), Handler)
+    sys.stderr.write("wordclock-web %s läuft auf http://%s:%d%s\n" % (
+        VERSION, args.bind, args.port, " (Demo)" if args.demo else ""))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

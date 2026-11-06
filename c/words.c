@@ -103,6 +103,14 @@ void set_word(ledbuf_t *b, word_id_t w) {
     }
 }
 
+void clear_word(ledbuf_t *b, word_id_t w) {
+    if ((int)w < 0 || w >= W_COUNT) return;
+    const word_def_t *wd = &words[w];
+    for (int i = 0; i < wd->nparts; i++) {
+        b->d[wd->part[i].chip][wd->part[i].digit] &= (uint8_t)~wd->part[i].mask;
+    }
+}
+
 const char *word_name(word_id_t w) {
     if ((int)w < 0 || w >= W_COUNT) return "?";
     return words[w].name;

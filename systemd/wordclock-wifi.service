@@ -1,0 +1,16 @@
+[Unit]
+Description=Wortuhr: WLAN mit Setup-Hotspot als Rückfallebene
+Wants=dhcpcd.service
+After=dhcpcd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wordclock-wifi
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+# wpa_supplicant soll beim Stoppen des Dienstes weiterlaufen
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

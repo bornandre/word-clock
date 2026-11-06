@@ -25,4 +25,13 @@ jobs:
         run: python3 tools/check_layout.py
 
       - name: Python-Syntax prüfen
-        run: python3 -m py_compile tools/led_test.py tools/check_layout.py
+        run: python3 -m py_compile tools/led_test.py tools/check_layout.py tests/test_web.py
+
+      - name: Shell-Skript prüfen
+        run: shellcheck -S warning wifi/wordclock-wifi
+
+      - name: Installation in Testverzeichnis
+        working-directory: c
+        run: |
+          make install DESTDIR="$RUNNER_TEMP/root"
+          find "$RUNNER_TEMP/root" -type f

@@ -1,0 +1,4 @@
+invalid.conf:1: ungültiger Wert für brightness: hell
+invalid.conf:2: ungültiger Wert für night_start: 25:00
+invalid.conf:3: '=' fehlt
+brightness=3 night_enabled=0 night_start=22:00 night_end=06:30 night_brightness=6

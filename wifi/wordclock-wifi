@@ -1,0 +1,242 @@
+#!/bin/bash
+#
+# wordclock-wifi – WLAN-Verbindung mit Hotspot-Fallback (Raspberry Pi OS Bullseye, dhcpcd)
+#
+# Ablauf:
+#   1. Mit den bekannten WLANs aus wpa_supplicant.conf verbinden.
+#   2. Klappt das nicht innerhalb von connect_timeout Sekunden, wird ein eigener
+#      Hotspot gestartet (hostapd + dnsmasq). Alle DNS-Anfragen zeigen auf den Pi,
+#      Handys öffnen dadurch automatisch die Konfigurationsseite.
+#   3. Der Hotspot bleibt, bis über die Webseite ein WLAN eingetragen wird
+#      (systemctl reload wordclock-wifi) oder ap_retry_minutes lang kein Gerät
+#      verbunden war – dann wird das WLAN erneut versucht.
+#   4. Geht eine bestehende Verbindung 2 Minuten lang verloren, beginnt alles von vorn.
+#
+# Solange der Hotspot läuft, existiert /run/wordclock/ap-mode; piclock lässt dann
+# die Minutenpunkte blinken.
+#
+# Voraussetzung: in /etc/dhcpcd.conf steht "nohook wpa_supplicant"
+# (wird von "make install-wifi" eingetragen), damit dieser Dienst wpa_supplicant
+# selbst steuert.
+
+set -u
+
+CONF=${WORDCLOCK_CONF:-/etc/wordclock/wordclock.conf}
+SECRET=${WORDCLOCK_SECRET:-/etc/wordclock/secret.conf}
+WPA_CONF=${WORDCLOCK_WPA_CONF:-/etc/wpa_supplicant/wpa_supplicant.conf}
+RUN=/run/wordclock
+AP_ADDR=10.42.0.1
+LOST_LIMIT=120          # Sekunden ohne Verbindung, bis neu verbunden wird
+POLL=${WORDCLOCK_POLL:-15}   # Prüfintervall in Sekunden
+
+RELOAD=0
+
+log()   { echo "$*"; }
+state() { echo "$1" > "$RUN/state"; }
+
+# Wert aus einer key=value-Datei lesen: cfg DATEI SCHLÜSSEL STANDARD
+cfg() {
+    local v
+    v=$(sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null \
+        | sed 's/[[:space:]]#.*$//; s/[[:space:]]*$//' | tail -n 1)
+    printf '%s' "${v:-$3}"
+}
+
+# Wie cfg, aber ohne Kommentare zu entfernen (Passwörter dürfen '#' enthalten)
+cfg_raw() {
+    local v
+    v=$(sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]\{0,1\}//p" "$1" 2>/dev/null | tail -n 1)
+    printf '%s' "${v:-$3}"
+}
+
+load_config() {
+    IFACE=$(cfg "$CONF" wifi_interface wlan0)
+    AP_SSID=$(cfg "$CONF" ap_ssid WordClock-Setup)
+    AP_CHANNEL=$(cfg "$CONF" ap_channel 6)
+    CONNECT_TIMEOUT=$(cfg "$CONF" connect_timeout 60)
+    AP_RETRY=$(cfg "$CONF" ap_retry_minutes 10)
+    AP_PASS=$(cfg_raw "$SECRET" password wordclock)
+    if [ "${#AP_PASS}" -lt 8 ] || [ "${#AP_PASS}" -gt 63 ]; then
+        log "Passwort muss 8 bis 63 Zeichen haben, verwende 'wordclock'"
+        AP_PASS=wordclock
+    fi
+    COUNTRY=$(sed -n 's/^[[:space:]]*country=//p' "$WPA_CONF" 2>/dev/null | head -n 1)
+    COUNTRY=${COUNTRY:-CH}
+}
+
+# ---------------------------------------------------------------------------
+# WLAN-Client
+# ---------------------------------------------------------------------------
+wpa_running() { wpa_cli -i "$IFACE" status >/dev/null 2>&1; }
+
+have_networks() { grep -q '^[[:space:]]*network[[:space:]]*=' "$WPA_CONF" 2>/dev/null; }
+
+connected() {
+    wpa_cli -i "$IFACE" status 2>/dev/null | grep -q '^wpa_state=COMPLETED' &&
+        ip -4 addr show dev "$IFACE" | grep -q 'inet '
+}
+
+current_ssid() { wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^ssid=//p'; }
+
+start_client() {
+    stop_ap
+    state connecting
+    ip addr flush dev "$IFACE"
+    ip link set "$IFACE" up
+    if wpa_running; then
+        wpa_cli -i "$IFACE" reconfigure >/dev/null
+    else
+        wpa_supplicant -B -i "$IFACE" -c "$WPA_CONF" -D nl80211,wext \
+            -P "$RUN/wpa_supplicant.pid" >/dev/null
+    fi
+    dhcpcd -n "$IFACE" >/dev/null 2>&1
+}
+
+wait_connected() {
+    local t=0
+    while [ "$t" -lt "$1" ]; do
+        connected && return 0
+        sleep 2
+        t=$((t + 2))
+        [ "$RELOAD" = 1 ] && return 1
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Hotspot
+# ---------------------------------------------------------------------------
+kill_pidfile() {
+    if [ -f "$1" ]; then
+        kill "$(cat "$1")" 2>/dev/null
+        rm -f "$1"
+    fi
+}
+
+stop_ap() {
+    kill_pidfile "$RUN/dnsmasq.pid"
+    kill_pidfile "$RUN/hostapd.pid"
+    ip addr del "$AP_ADDR/24" dev "$IFACE" 2>/dev/null
+    rm -f "$RUN/ap-mode"
+}
+
+start_ap() {
+    log "Starte Hotspot \"$AP_SSID\" (http://$AP_ADDR)"
+    state ap
+
+    wpa_cli -i "$IFACE" terminate >/dev/null 2>&1
+    kill_pidfile "$RUN/wpa_supplicant.pid"
+    dhcpcd -k "$IFACE" >/dev/null 2>&1
+    sleep 1
+    ip addr flush dev "$IFACE"
+    ip link set "$IFACE" up
+    ip addr add "$AP_ADDR/24" dev "$IFACE"
+
+    (
+        umask 077
+        cat > "$RUN/hostapd.conf" <<EOF
+interface=$IFACE
+driver=nl80211
+ssid=$AP_SSID
+country_code=$COUNTRY
+hw_mode=g
+channel=$AP_CHANNEL
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$AP_PASS
+ctrl_interface=$RUN/hostapd
+EOF
+        cat > "$RUN/dnsmasq.conf" <<EOF
+interface=$IFACE
+bind-interfaces
+listen-address=$AP_ADDR
+dhcp-range=10.42.0.10,10.42.0.100,255.255.255.0,1h
+dhcp-option=option:router,$AP_ADDR
+dhcp-option=option:dns-server,$AP_ADDR
+dhcp-option=114,"http://$AP_ADDR/"
+dhcp-leasefile=$RUN/dnsmasq.leases
+address=/#/$AP_ADDR
+no-resolv
+no-hosts
+EOF
+    )
+
+    if ! hostapd -B -P "$RUN/hostapd.pid" "$RUN/hostapd.conf" >/dev/null; then
+        log "FEHLER: hostapd konnte nicht starten (unterstützt der WLAN-Stick den AP-Modus?)"
+        state error
+        return 1
+    fi
+    if ! dnsmasq -C "$RUN/dnsmasq.conf" -x "$RUN/dnsmasq.pid"; then
+        log "FEHLER: dnsmasq konnte nicht starten (läuft schon ein anderer DNS-/DHCP-Server?)"
+    fi
+    touch "$RUN/ap-mode"
+    return 0
+}
+
+ap_has_clients() { iw dev "$IFACE" station dump 2>/dev/null | grep -q '^Station'; }
+
+# ---------------------------------------------------------------------------
+
+# Schlafen, aber bei SIGHUP sofort aufwachen
+nap() {
+    sleep "$1" &
+    wait $! 2>/dev/null
+}
+
+on_exit() {
+    log "Beende, WLAN-Client wird wieder gestartet"
+    stop_ap
+    start_client
+    rm -f "$RUN/state"
+    exit 0
+}
+
+trap 'RELOAD=1' HUP
+trap on_exit TERM INT
+
+mkdir -p "$RUN"
+rfkill unblock wlan 2>/dev/null
+
+while :; do
+    RELOAD=0
+    load_config
+
+    if have_networks; then
+        log "Verbinde mit WLAN ..."
+        start_client
+        if wait_connected "$CONNECT_TIMEOUT"; then
+            state client
+            log "Verbunden mit \"$(current_ssid)\""
+            lost=0
+            while [ "$RELOAD" = 0 ]; do
+                nap "$POLL"
+                if connected; then lost=0; else lost=$((lost + POLL)); fi
+                if [ "$lost" -ge "$LOST_LIMIT" ]; then
+                    log "WLAN-Verbindung seit $LOST_LIMIT s unterbrochen"
+                    break
+                fi
+            done
+            continue
+        fi
+        [ "$RELOAD" = 1 ] && continue
+        log "Keine Verbindung nach $CONNECT_TIMEOUT s"
+    else
+        log "Kein WLAN eingerichtet"
+    fi
+
+    if ! start_ap; then
+        nap 60
+        continue
+    fi
+    idle=0
+    while [ "$RELOAD" = 0 ]; do
+        nap "$POLL"
+        if ap_has_clients; then idle=0; else idle=$((idle + POLL)); fi
+        if have_networks && [ "$idle" -ge $((AP_RETRY * 60)) ]; then
+            log "$AP_RETRY min kein Gerät am Hotspot, versuche WLAN erneut"
+            break
+        fi
+    done
+done

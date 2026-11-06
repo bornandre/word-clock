@@ -4,6 +4,7 @@ c/piclock
 c/piclock32
 c/test_leds
 tests/actual_times.txt
+__pycache__/
 
 # Python
 __pycache__/

@@ -32,6 +32,7 @@ typedef enum {
 
 void        ledbuf_clear(ledbuf_t *b);
 void        set_word(ledbuf_t *b, word_id_t w);       /* Wort hinzufügen (ODER) */
+void        clear_word(ledbuf_t *b, word_id_t w);     /* Wort entfernen         */
 const char *word_name(word_id_t w);
 
 /* Komplette Uhrzeit in den Puffer schreiben.

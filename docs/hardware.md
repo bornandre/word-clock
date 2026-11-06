@@ -4,7 +4,7 @@
 
 | Anzahl | Teil | Bemerkung |
 |-------:|------|-----------|
-| 1 | Raspberry Pi 4 | andere Modelle mit I2C gehen auch |
+| 1 | Raspberry Pi (ab Modell 1 B) | für den Setup-Hotspot WLAN mit AP-Modus |
 | 4 | SAA1064 | LED-Treiber mit I2C, 4 × 8 Ausgänge im Multiplex |
 | 8 | Digit-Transistoren | 2 pro SAA1064 an MX1 / MX2, Typ gemäss Datenblatt-Schaltung |
 | 4 | Kondensator (typ. 2,7 nF) | an Cext, bestimmt den Multiplex-Takt |
